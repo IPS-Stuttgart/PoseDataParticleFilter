@@ -5,19 +5,47 @@ import quaternion
 import os
 import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import pyrecest
 from pyrecest.filters import *
 from pyrecest.distributions import *
+import requests
+import io
+import gdown
 
 input_path = r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\KIT_Quaternions\3\912_3_01_poses_quaternions.npz"
 
-data = np.load(input_path, allow_pickle=True)
+
+file_id = "1uDQf4jswrMZ_M6Z-RdhlpM0ybMS99gnw"  # replace with yours
+
+
+# response = requests.get(url)
+# data = np.load(io.BytesIO(response.content))
+
+
+def process_sequence(file_id):
+    buffer = io.BytesIO()
+    gdown.download(id=file_id, output=buffer, quiet=False)
+    buffer.seek(0)
+    data = np.load(buffer, allow_pickle=True)
+    print(data.files)
+    poses = data['poses_quat']  
+    trans= data['trans']
+    betas= data['betas']
+    gender= data['gender']
+    dmpls= data['dmpls']
+    mocap_framerate= data['mocap_framerate']
+    return trans, betas, gender, dmpls, mocap_framerate, poses 
+
+trans, betas, gender, dmpls, mocap_framerate, poses = process_sequence(file_id)
+
+# data = np.load(input_path, allow_pickle=True)
 
 # pf = HyperhemisphericalParticleFilter(n_particles=1000, dim=3)
 pf= HyperhemisphericalParticleFilter(n_particles= 1000, dim =3)
-print(data.files)
+# print(data.files)
 
-poses= data['poses_quat']
+# poses= data['poses_quat']
 joint_idx= 16
 # print(poses[0][0])
 
@@ -104,28 +132,80 @@ def quat_geodesic_distance(q1, q2):
     return 2 * np.arccos(dot)
 
 # Calculate jump magnitude between consecutive observed frames
-# jump_magnitudes = []
-# for frame_idx in range(1, num_frames):
-#     q1 = poses[frame_idx - 1, joint_idx, :]  # previous frame
-#     q2 = poses[frame_idx, joint_idx, :]      # current frame
+jump_magnitudes = []
+for frame_idx in range(1, num_frames):
+    q1 = estimates[frame_idx - 1, joint_idx, :]  # previous frame
+    q2 = estimates[frame_idx, joint_idx, :]      # current frame
     
-#     # convert to pyrecest format (x,y,z,w)
-#     q1 = np.array([q1[1], q1[2], q1[3], q1[0]])
-#     q2 = np.array([q2[1], q2[2], q2[3], q2[0]])
+    # convert to pyrecest format (x,y,z,w)
+    q1 = np.array([q1[1], q1[2], q1[3], q1[0]])
+    q2 = np.array([q2[1], q2[2], q2[3], q2[0]])
     
-#     # enforce upper hemisphere
-#     if q1[-1] < 0: q1 = -q1
-#     if q2[-1] < 0: q2 = -q2
+    # enforce upper hemisphere
+    if q1[-1] < 0: q1 = -q1
+    if q2[-1] < 0: q2 = -q2
     
-#     dist = quat_geodesic_distance(q1, q2)
-#     jump_magnitudes.append(dist)
+    dist = quat_geodesic_distance(q1, q2)
+    jump_magnitudes.append(dist)
 
-# jump_magnitudes = np.array(jump_magnitudes)
+jump_magnitudes = np.array(jump_magnitudes)
 
 # # Adaptive threshold: mean + 3*std
-# mean_jump = np.mean(jump_magnitudes)
-# std_jump  = np.std(jump_magnitudes)
-# threshold = mean_jump + 3 * std_jump
+mean_jump = np.mean(jump_magnitudes)
+std_jump  = np.std(jump_magnitudes)
+threshold = mean_jump + 3 * std_jump
+
+fig, ax = plt.subplots(figsize=(14, 5))
+frames = np.arange(1, num_frames)
+
+# --- split into normal / anomaly series for cleaner legend ---
+anomaly_mask = jump_magnitudes > threshold
+normal_mask  = ~anomaly_mask
+
+# main jump line
+ax.plot(frames, jump_magnitudes, color='#378ADD', linewidth=1.2,
+        alpha=0.85, zorder=2, label='jump magnitude')
+
+# shade under the line
+ax.fill_between(frames, jump_magnitudes, alpha=0.08, color='#378ADD', zorder=1)
+
+# threshold + mean lines
+ax.axhline(threshold, color='#E24B4A', linewidth=1.4, linestyle='--',
+           zorder=3, label=f'threshold  μ+3σ  ({threshold:.3f} rad)')
+ax.axhline(mean_jump,  color='#888780', linewidth=1.0, linestyle=':',
+           zorder=3, label=f'mean  ({mean_jump:.3f} rad)')
+
+# anomaly scatter
+ax.scatter(frames[anomaly_mask], jump_magnitudes[anomaly_mask],
+           color='#E24B4A', s=55, zorder=5, label=f'anomaly  (n={anomaly_mask.sum()})')
+
+# vertical drop-lines from anomaly dots to x-axis (optional, aids reading)
+for f, v in zip(frames[anomaly_mask], jump_magnitudes[anomaly_mask]):
+    ax.vlines(f, 0, v, color='#E24B4A', linewidth=0.6, alpha=0.35, zorder=4)
+
+# --- shaded band: mean ± 1σ ---
+ax.axhspan(mean_jump - std_jump, mean_jump + std_jump,
+           color='#888780', alpha=0.07, zorder=0, label='±1σ band')
+
+# labels & formatting
+ax.set_xlabel('Frame index', fontsize=11)
+ax.set_ylabel('Geodesic distance (rad)', fontsize=11)
+ax.set_title(f'Orientation jump magnitudes — joint {joint_idx}', fontsize=13, fontweight='normal')
+ax.set_xlim(frames[0], frames[-1])
+ax.set_ylim(bottom=0)
+ax.grid(True, linewidth=0.4, alpha=0.5, linestyle='--')
+ax.spines[['top', 'right']].set_visible(False)
+ax.legend(fontsize=9, framealpha=0.85, loc='upper right')
+
+# annotate anomaly frame indices
+for f, v in zip(frames[anomaly_mask], jump_magnitudes[anomaly_mask]):
+    ax.annotate(f'f{f}', xy=(f, v), xytext=(4, 6),
+                textcoords='offset points', fontsize=8,
+                color='#E24B4A', fontweight='bold')
+
+plt.tight_layout()
+plt.savefig(f'jump_magnitudes_joint{joint_idx}.png', dpi=150, bbox_inches='tight')
+plt.show()
 
 # anomaly_frames = np.where(jump_magnitudes > threshold)[0] + 1  # +1 because diff starts at frame 1
 
