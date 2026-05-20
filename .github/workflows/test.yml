@@ -1,4 +1,4 @@
-name: Test Runner PoseDataParticleFilter
+name: Test Runner PoseData
 on: [push]
 
 jobs:
