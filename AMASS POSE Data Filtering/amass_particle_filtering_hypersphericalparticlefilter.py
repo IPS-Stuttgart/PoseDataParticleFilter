@@ -44,6 +44,62 @@ process_noise_std = 0.01
 high_measurement_kappa = 500.0
 low_measurement_kappa = 50.0
 jump_threshold_std_multiplier = 3.0
+MAX_SAFE_KAPPA = 500.0
+
+
+
+class OnlineKappaEstimator:
+    """
+    Maintains a per-joint running estimate of mean jump and std,
+    then recomputes kappa bounds each frame via EMA.
+    """
+    def __init__(self, n_joints, alpha=0.02, 
+                 initial_mean=None, initial_std=None):
+        """
+        alpha: EMA smoothing factor. 
+               ~0.02 → memory of ~50 frames (slow adaptation, stable).
+               ~0.1  → memory of ~10 frames (fast adaptation, responsive).
+        """
+        self.alpha = alpha
+        self.ema_mean = initial_mean.copy() if initial_mean is not None \
+                        else np.full(n_joints, 0.1)
+        self.ema_var  = (initial_std ** 2).copy() if initial_std is not None \
+                        else np.full(n_joints, 0.01)
+
+    # def update(self, jumps):
+    #     """jumps: shape (n_joints,) — geodesic distances for current frame."""
+    #     self.ema_mean += self.alpha * (jumps - self.ema_mean)
+    #     self.ema_var  += self.alpha * (
+    #         (jumps - self.ema_mean) ** 2 - self.ema_var
+    #     )
+
+    def update(self, jumps):
+        """jumps: shape (n_joints,) — geodesic distances for current frame."""
+        delta_pre  = jumps - self.ema_mean                        # residual w.r.t. OLD mean
+        
+        self.ema_mean += self.alpha * delta_pre                   # update mean
+        
+        delta_post = jumps - self.ema_mean                        # residual w.r.t. NEW mean
+        
+        # Welford-style: cross product of pre/post deltas gives unbiased variance update
+        self.ema_var = (1.0 - self.alpha) * self.ema_var + \
+                    self.alpha * delta_pre * delta_post        # ← correct
+    
+
+
+    def kappa_bounds(self, std_multiplier=3.0):
+        ema_std   = np.sqrt(np.maximum(self.ema_var, 1e-8))
+        threshold = self.ema_mean + std_multiplier * ema_std
+
+        high_kappa = np.clip(1.0 / (2.0 * self.ema_mean ** 2), 10.0, 500.0)  # ← 500 not 2000
+        low_kappa  = np.clip(1.0 / (2.0 * threshold ** 2),      1.0, 100.0)
+
+        return high_kappa, low_kappa, threshold
+    
+
+
+
+
 
 
 def normalize_quat(q):
@@ -87,22 +143,129 @@ def compute_observed_jump_statistics(poses):
 
     return observed_jumps, mean_jumps, std_jumps, thresholds
 
+def compute_kappa_bounds(mean_jump_per_joint, std_jump_per_joint, jump_thresholds):
+    """
+    high_kappa: tight trust — derived from typical (mean) jump size.
+    low_kappa:  loose trust — derived from the anomaly threshold.
+    Clipped to sane physical limits to avoid numerical issues.
+    """
+    # At normal motion: spread ≈ mean_jump → kappa_high ≈ 1/(2*mean²)
+    high_kappa = np.clip(
+        1.0 / (2.0 * mean_jump_per_joint ** 2 + 1e-8),
+        10.0, 2000.0
+    )
+    # At anomalous motion: spread ≈ threshold → kappa_low ≈ 1/(2*threshold²)
+    low_kappa = np.clip(
+        1.0 / (2.0 * jump_thresholds ** 2 + 1e-8),
+        1.0, 200.0
+    )
+    return high_kappa, low_kappa
 
-def adaptive_measurement_kappa(current_jump, mean_jump, threshold):
-    if current_jump <= mean_jump:
-        return high_measurement_kappa
 
-    if current_jump >= threshold or np.isclose(threshold, mean_jump):
-        return low_measurement_kappa
 
-    jump_ratio = (current_jump - mean_jump) / (threshold - mean_jump)
-    return high_measurement_kappa - jump_ratio * (high_measurement_kappa - low_measurement_kappa)
+# def adaptive_measurement_kappa(current_jump, mean_jump, threshold):
+#     if current_jump <= mean_jump:
+#         return high_measurement_kappa
+
+#     if current_jump >= threshold or np.isclose(threshold, mean_jump):
+#         return low_measurement_kappa
+
+#     jump_ratio = (current_jump - mean_jump) / (threshold - mean_jump)
+#     return high_measurement_kappa - jump_ratio * (high_measurement_kappa - low_measurement_kappa)
 
 
 observed_jump_magnitudes, mean_jump_per_joint, std_jump_per_joint, jump_thresholds = (
     compute_observed_jump_statistics(poses)
 )
 
+high_kappa_per_joint, low_kappa_per_joint = compute_kappa_bounds(
+    mean_jump_per_joint, std_jump_per_joint, jump_thresholds
+)
+
+
+
+# EMA estimator — one object, tracks ALL joints simultaneously
+# warm-started so frame 1 already has sensible bounds
+kappa_estimator = OnlineKappaEstimator(
+    n_joints=num_joints,
+    alpha=0.02,
+    initial_mean=mean_jump_per_joint,
+    initial_std=std_jump_per_joint,
+)
+
+
+
+
+def adaptive_measurement_kappa(current_jump, mean_jump, threshold,
+                                   high_kappa, low_kappa, smoothness=3.0):
+    """
+    Smooth exponential blend between high_kappa and low_kappa.
+    All inputs are scalars (called per-joint inside the loop).
+    smoothness: controls how sharply kappa drops as jump approaches threshold.
+    """
+    jump_ratio = np.clip(
+        (current_jump - mean_jump) / (threshold - mean_jump + 1e-9),
+        0.0, 1.0
+    )
+    # Exponential decay: stays near high_kappa until ratio rises, then drops fast
+    blend = 1.0 - np.exp(-smoothness * (1.0 - jump_ratio))
+    # Remap so blend=0 → high_kappa, blend=1 → low_kappa
+    weight = np.exp(-smoothness * jump_ratio)
+    return high_kappa * weight + low_kappa * (1.0 - weight)
+
+
+
+
+
+def precompute_kappa_table(poses, num_frames, num_joints,
+                            std_multiplier=3.0, smoothness=3.0):
+    """
+    PASS 1: Single loop over all frames and joints.
+    Returns kappa_table shape (num_frames, num_joints) —
+    exact per-joint per-frame kappa, no EMA approximation.
+    """
+
+    # ── Step 1: compute all geodesic jumps ──────────────────────────────────
+    jump_magnitudes = np.zeros((num_frames - 1, num_joints))
+
+    for frame_idx in range(1, num_frames):
+        for joint_idx in range(num_joints):
+            q_prev = amass_to_filter_quat(poses[frame_idx - 1, joint_idx, :])
+            q_curr = amass_to_filter_quat(poses[frame_idx,     joint_idx, :])
+            jump_magnitudes[frame_idx - 1, joint_idx] = quat_geodesic_distance(q_prev, q_curr)
+
+    # ── Step 2: per-joint statistics (axis=0 → over frames) ─────────────────
+    mean_jump = np.mean(jump_magnitudes, axis=0)   # shape (n_joints,)
+    std_jump  = np.std(jump_magnitudes,  axis=0)   # shape (n_joints,)
+    threshold = mean_jump + std_multiplier * std_jump  # shape (n_joints,)
+
+    # ── Step 3: per-joint kappa bounds from statistics ───────────────────────
+    high_kappa = np.clip(1.0 / (2.0 * mean_jump ** 2 + 1e-8), 10.0, 500.0)
+    low_kappa  = np.clip(1.0 / (2.0 * threshold ** 2  + 1e-8),  1.0, 100.0)
+
+    # ── Step 4: per-frame per-joint kappa via smooth blend ───────────────────
+    # jump_magnitudes shape: (num_frames-1, num_joints)
+    # mean_jump, threshold shape: (num_joints,) → broadcast over frames
+
+    jump_ratio = np.clip(
+        (jump_magnitudes - mean_jump) / (threshold - mean_jump + 1e-9),
+        0.0, 1.0
+    )                                               # shape (num_frames-1, num_joints)
+
+    weight = np.exp(-smoothness * jump_ratio)       # shape (num_frames-1, num_joints)
+
+    kappa_table = np.clip(
+        high_kappa * weight + low_kappa * (1.0 - weight),
+        1.0, 500.0
+    )                                               # shape (num_frames-1, num_joints)
+
+    return kappa_table, jump_magnitudes, mean_jump, std_jump, threshold
+
+
+kappa_table, observed_jump_magnitudes, mean_jump_per_joint, \
+    std_jump_per_joint, jump_thresholds = precompute_kappa_table(
+        poses, num_frames, num_joints
+    )
 
 # One independent particle filter is maintained for each joint orientation.
 particle_filters = [
@@ -121,6 +284,13 @@ for current_joint_idx, pf in enumerate(particle_filters):
     estimates[0, current_joint_idx, :] = normalize_quat(pf.filter_state.mean())
 
 for frame_idx in range(1, num_frames):
+    # Called ONCE per frame — returns shape (n_joints,) arrays
+    # EMA state at this point reflects all frames seen so far
+    # hk, lk, thresh_online = kappa_estimator.kappa_bounds()
+
+    current_frame_jumps = observed_jump_magnitudes[frame_idx - 1]  
+
+
     for current_joint_idx, pf in enumerate(particle_filters):
         # STEP 1 - PREDICT (random walk with noise)
         particles = pf.filter_state.d
@@ -133,17 +303,30 @@ for frame_idx in range(1, num_frames):
 
         # STEP 3 - UPDATE (reweight particles against observation)
         current_jump = observed_jump_magnitudes[frame_idx - 1, current_joint_idx]
-        measurement_kappa = adaptive_measurement_kappa(
-            current_jump,
-            mean_jump_per_joint[current_joint_idx],
-            jump_thresholds[current_joint_idx],
-        )
+        # measurement_kappa = adaptive_measurement_kappa(
+        #     current_jump,
+        #     mean_jump_per_joint[current_joint_idx],
+        #     jump_thresholds[current_joint_idx],
+        # )
+        # measurement_kappa = adaptive_measurement_kappa(
+        #     current_jump = current_frame_jumps[current_joint_idx],
+        #     mean_jump    = kappa_estimator.ema_mean[current_joint_idx],
+        #     threshold    = thresh_online[current_joint_idx],
+        #     high_kappa   = hk[current_joint_idx],
+        #     low_kappa    = lk[current_joint_idx],
+        # )
+        measurement_kappa = float(kappa_table[frame_idx - 1, current_joint_idx])
         measurement_kappas[frame_idx, current_joint_idx] = measurement_kappa
+        # measurement_kappa = float(np.clip(measurement_kappa, 1.0, MAX_SAFE_KAPPA))
+        # measurement_kappas[frame_idx, current_joint_idx] = measurement_kappa
         meas_noise = HyperhemisphericalWatsonDistribution(q_obs, kappa=measurement_kappa)
         pf.update_nonlinear_using_likelihood(meas_noise.pdf)
 
         # STEP 4 - GET ESTIMATE
         estimates[frame_idx, current_joint_idx, :] = normalize_quat(pf.filter_state.mean())
+    # EMA update — AFTER all joints processed for this frame
+    # uses current_frame_jumps shape (n_joints,) — updates all joints at once
+    # kappa_estimator.update(current_frame_jumps)
 
 # Optional copy in AMASS/numpy-quaternion order (w, x, y, z), useful when saving
 # estimates alongside the original AMASS pose data.
