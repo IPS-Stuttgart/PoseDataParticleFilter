@@ -4,24 +4,24 @@ from pathlib import Path
 import quaternion
 import os
 
-INPUT_FOLDER= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\KIT\3"
-OUTPUT_FOLDER= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\KIT_Quaternions\3"
+input_path= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\PoseDataParticleFilter\Subject_1_F_1_poses.npz"
+output_path= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\PoseDataParticleFilter\Subject_1_F_1_poses_quaternion.npz"
 
 # Create output folder if it doesn't exist
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+# os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 #Get All files in the input folder
-all_files = [f for f in os.listdir(INPUT_FOLDER) if f.endswith('.npz')]
-print(f"Found {len(all_files)} files to process")
+# all_files = [f for f in os.listdir(INPUT_FOLDER) if f.endswith('.npz')]
+# print(f"Found {len(all_files)} files to process")
 
 # Load your .npz file
-for idx, filename in enumerate(all_files):
-   input_path  = os.path.join(INPUT_FOLDER, filename)
-   output_path = os.path.join(OUTPUT_FOLDER, filename.replace('.npz', '_quaternions.npz'))
+# for idx, filename in enumerate(all_files):
+#    input_path  = os.path.join(INPUT_FOLDER, filename)
+#    output_path = os.path.join(OUTPUT_FOLDER, filename.replace('.npz', '_quaternions.npz'))
 
-   print(f"\n[{idx+1}/{len(all_files)}] Processing: {filename}")
+#    print(f"\n[{idx+1}/{len(all_files)}] Processing: {filename}")
 
-   try:
+try:
       data = np.load(input_path, allow_pickle=True)
         
       trans         = data['trans']          
@@ -62,8 +62,8 @@ for idx, filename in enumerate(all_files):
       print(f"Saved  | frames={T} | shape={quaternion_poses_arr.shape} | path={output_path}")
       
 
-   except Exception as e:
-        print(f"FAILED: {filename} | Error: {e}")
+except Exception as e:
+        print(f"FAILED: Subject_1_F_1_poses_quaternion | Error: {e}")
         raise
    
 

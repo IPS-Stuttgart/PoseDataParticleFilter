@@ -3,7 +3,7 @@ import numpy as np
 # data = np.load(":\Users\RaghavBansal\OneDrive - ProcDNA Analytics Pvt. Ltd\Desktop\amass\KIT\KIT\3\912_3_01_poses.npz")
 # import numpy as np
 
-data = np.load(r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\KIT\3\912_3_01_poses.npz")
+data = np.load(r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\PoseDataParticleFilter\Subject_1_F_1_poses.npz")
 print(data.files)   # shows all arrays inside
 
 

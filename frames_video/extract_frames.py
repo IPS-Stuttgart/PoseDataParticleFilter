@@ -1,8 +1,8 @@
 import cv2
 import os
 
-video_path = "C:\\Users\\RaghavBansal\\OneDrive - ProcDNA Analytics Pvt. Ltd\\Desktop\\amass\\PoseDataParticleFilter\\PoseDataParticleFilter\\frames_video\\912_3_01.mp4"
-output_folder = "frames"
+video_path = r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\BMLmovi\actual_human_videos\F_CP1_Subject_1.mp4"
+output_folder = "frames_BML_movi"
 
 os.makedirs(output_folder, exist_ok=True)
 
