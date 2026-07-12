@@ -1,537 +1,443 @@
-import numpy as np
-from scipy.spatial.transform import Rotation as R
-from pathlib import Path
-# import quaternion
-import os
-import matplotlib
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import pyrecest
-from pyrecest.filters import *
-from pyrecest.distributions import *
-import requests
+"""Bidirectional hyperhemispherical particle-filter diagnostics for AMASS poses.
+
+The anomaly score for each joint-frame is the geodesic distance between the
+observed quaternion and the pre-update HHPF prediction.  A frame is flagged
+only when both the forward and backward filters consider it unlikely.
+"""
+
+from __future__ import annotations
+
 import io
+from pathlib import Path
+
 import gdown
+import matplotlib.pyplot as plt
+import numpy as np
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from pyrecest.distributions import (
+    HyperhemisphericalDiracDistribution,
+    HyperhemisphericalWatsonDistribution,
+)
+from pyrecest.filters import HyperhemisphericalParticleFilter
 
-input_path = r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\KIT_Quaternions\3\912_3_01_poses_quaternions.npz"
+
+FILE_ID = "1F-XL8Tf59lbakNkMhEPjvkr3wT4O0MEW"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = PROJECT_ROOT / "outputs"
+RANDOM_SEED = 20260712
+N_PARTICLES = 1000
+PROCESS_NOISE_STD = 0.01
+MEASUREMENT_KAPPA = 500.0
+MAD_MULTIPLIER = 4.0
+MIN_SCORE_DEG = 5.0
+JOINT_IDX_FOR_PLOT = 16
+EXCEL_REPORT_PATH = OUTPUT_DIR / "bidirectional_hhpf_incorrect_frames.xlsx"
 
 
-file_id = "1F-XL8Tf59lbakNkMhEPjvkr3wT4O0MEW"  # File Id of Motion Clip on Google Drive (.npz file)
-
-def process_sequence(file_id):
+def process_sequence(file_id: str):
+    """Download and return an AMASS quaternion sequence."""
     buffer = io.BytesIO()
     gdown.download(id=file_id, output=buffer, quiet=False)
     buffer.seek(0)
     data = np.load(buffer, allow_pickle=True)
-    print(data.files)
-    poses = data['poses_quat']  
-    trans= data['trans']
-    betas= data['betas']
-    gender= data['gender']
-    dmpls= data['dmpls']
-    mocap_framerate= data['mocap_framerate']
-    print(len(poses))
-    return trans, betas, gender, dmpls, mocap_framerate, poses 
-
-trans, betas, gender, dmpls, mocap_framerate, poses = process_sequence(file_id)
-
-# data = np.load(input_path, allow_pickle=True)
-
-joint_idx = 16  # joint used below for diagnostic plots
-num_frames = len(poses)
-num_joints = poses.shape[1]
-n_particles = 1000
-process_noise_std = 0.01
-high_measurement_kappa = 500.0
-low_measurement_kappa = 50.0
-jump_threshold_std_multiplier = 3.0
-MAX_SAFE_KAPPA = 500.0
+    print(f"Loaded keys: {data.files}")
+    return data["poses_quat"]
 
 
-
-class OnlineKappaEstimator:
-    """
-    Maintains a per-joint running estimate of mean jump and std,
-    then recomputes kappa bounds each frame via EMA.
-    """
-    def __init__(self, n_joints, alpha=0.02, 
-                 initial_mean=None, initial_std=None):
-        """
-        alpha: EMA smoothing factor. 
-               ~0.02 → memory of ~50 frames (slow adaptation, stable).
-               ~0.1  → memory of ~10 frames (fast adaptation, responsive).
-        """
-        self.alpha = alpha
-        self.ema_mean = initial_mean.copy() if initial_mean is not None \
-                        else np.full(n_joints, 0.1)
-        self.ema_var  = (initial_std ** 2).copy() if initial_std is not None \
-                        else np.full(n_joints, 0.01)
-
-    # def update(self, jumps):
-    #     """jumps: shape (n_joints,) — geodesic distances for current frame."""
-    #     self.ema_mean += self.alpha * (jumps - self.ema_mean)
-    #     self.ema_var  += self.alpha * (
-    #         (jumps - self.ema_mean) ** 2 - self.ema_var
-    #     )
-
-    def update(self, jumps):
-        """jumps: shape (n_joints,) — geodesic distances for current frame."""
-        delta_pre  = jumps - self.ema_mean                        # residual w.r.t. OLD mean
-        
-        self.ema_mean += self.alpha * delta_pre                   # update mean
-        
-        delta_post = jumps - self.ema_mean                        # residual w.r.t. NEW mean
-        
-        # Welford-style: cross product of pre/post deltas gives unbiased variance update
-        self.ema_var = (1.0 - self.alpha) * self.ema_var + \
-                    self.alpha * delta_pre * delta_post        # ← correct
-    
-
-
-    def kappa_bounds(self, std_multiplier=3.0):
-        ema_std   = np.sqrt(np.maximum(self.ema_var, 1e-8))
-        threshold = self.ema_mean + std_multiplier * ema_std
-
-        high_kappa = np.clip(1.0 / (2.0 * self.ema_mean ** 2), 10.0, 500.0)  # ← 500 not 2000
-        low_kappa  = np.clip(1.0 / (2.0 * threshold ** 2),      1.0, 100.0)
-
-        return high_kappa, low_kappa, threshold
-    
-
-
-
-
-
-
-def normalize_quat(q):
-    q = q / np.linalg.norm(q, axis=-1, keepdims=True)
+def normalize_quat(q: np.ndarray) -> np.ndarray:
+    """Normalize quaternions and choose the upper-hemisphere representative."""
+    q = np.asarray(q, dtype=np.float64)
+    norms = np.linalg.norm(q, axis=-1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError("Quaternion input contains a zero-norm value.")
+    q = q / norms
     q = np.array(q, copy=True)
     q *= np.where(q[..., -1:] < 0, -1.0, 1.0)
     return q
 
 
-def amass_to_filter_quat(q_amass):
-    """Convert AMASS quaternion format (w, x, y, z) to PyRecEst format (x, y, z, w)."""
-    q = np.array([q_amass[1], q_amass[2], q_amass[3], q_amass[0]])
-    return normalize_quat(q)
+def amass_to_filter_quat(poses_amass: np.ndarray) -> np.ndarray:
+    """Convert AMASS quaternion order ``(w, x, y, z)`` to ``(x, y, z, w)``."""
+    return normalize_quat(poses_amass[..., [1, 2, 3, 0]])
 
 
-def initialize_particles(q, n_particles, noise_std):
-    particles = q + np.random.randn(n_particles, 4) * noise_std
+def quat_multiply(q_left: np.ndarray, q_right: np.ndarray) -> np.ndarray:
+    """Hamilton product for quaternions in ``(x, y, z, w)`` order."""
+    x1, y1, z1, w1 = np.moveaxis(q_left, -1, 0)
+    x2, y2, z2, w2 = np.moveaxis(q_right, -1, 0)
+    return np.stack(
+        (
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ),
+        axis=-1,
+    )
+
+
+def quat_conjugate(q: np.ndarray) -> np.ndarray:
+    q = np.array(q, copy=True)
+    q[..., :3] *= -1
+    return q
+
+
+def quat_geodesic_distance(q1: np.ndarray, q2: np.ndarray) -> float:
+    """Return the shortest angular distance between two orientations."""
+    q1 = normalize_quat(q1)
+    q2 = normalize_quat(q2)
+    dot = float(np.clip(abs(np.dot(q1, q2)), 0.0, 1.0))
+    return float(2.0 * np.arccos(dot))
+
+
+def initialize_particles(q: np.ndarray) -> np.ndarray:
+    particles = q + np.random.randn(N_PARTICLES, 4) * PROCESS_NOISE_STD
     return normalize_quat(particles)
 
 
-def quat_geodesic_distance(q1, q2):
-    """Angular distance between two quaternions in radians."""
-    q1 = normalize_quat(q1)
-    q2 = normalize_quat(q2)
-    dot = np.clip(np.abs(np.dot(q1, q2)), 0, 1)  # abs handles double cover
-    return 2 * np.arccos(dot)
+def run_directional_hhpf(
+    observations: np.ndarray,
+    frame_order: np.ndarray,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run one causal HHPF pass over the supplied frame order.
 
-
-def compute_observed_jump_statistics(poses):
-    observed_jumps = np.zeros((num_frames - 1, num_joints))
-
-    for frame_idx in range(1, num_frames):
-        for current_joint_idx in range(num_joints):
-            q_prev = amass_to_filter_quat(poses[frame_idx - 1, current_joint_idx, :])
-            q_curr = amass_to_filter_quat(poses[frame_idx, current_joint_idx, :])
-            observed_jumps[frame_idx - 1, current_joint_idx] = quat_geodesic_distance(q_prev, q_curr)
-
-    mean_jumps = np.mean(observed_jumps, axis=0)
-    std_jumps = np.std(observed_jumps, axis=0)
-    thresholds = mean_jumps + jump_threshold_std_multiplier * std_jumps
-
-    return observed_jumps, mean_jumps, std_jumps, thresholds
-
-def compute_kappa_bounds(mean_jump_per_joint, std_jump_per_joint, jump_thresholds):
+    ``predicted`` is always saved before the observation update, so its
+    residual measures an observation against a prediction that did not use
+    that observation.  With reversed ``frame_order``, the same logic predicts
+    from future original frames.
     """
-    high_kappa: tight trust — derived from typical (mean) jump size.
-    low_kappa:  loose trust — derived from the anomaly threshold.
-    Clipped to sane physical limits to avoid numerical issues.
-    """
-    # At normal motion: spread ≈ mean_jump → kappa_high ≈ 1/(2*mean²)
-    high_kappa = np.clip(
-        1.0 / (2.0 * mean_jump_per_joint ** 2 + 1e-8),
-        10.0, 2000.0
-    )
-    # At anomalous motion: spread ≈ threshold → kappa_low ≈ 1/(2*threshold²)
-    low_kappa = np.clip(
-        1.0 / (2.0 * jump_thresholds ** 2 + 1e-8),
-        1.0, 200.0
-    )
-    return high_kappa, low_kappa
+    np.random.seed(seed)
+
+    num_frames, num_joints, _ = observations.shape
+    predicted = np.full((num_frames, num_joints, 4), np.nan)
+    posterior = np.full((num_frames, num_joints, 4), np.nan)
+    residuals = np.full((num_frames, num_joints), np.nan)
+    particle_filters = [
+        HyperhemisphericalParticleFilter(n_particles=N_PARTICLES, dim=3)
+        for _ in range(num_joints)
+    ]
+
+    initial_frame = int(frame_order[0])
+    for joint_idx, particle_filter in enumerate(particle_filters):
+        q_initial = observations[initial_frame, joint_idx]
+        particle_filter.set_state(
+            HyperhemisphericalDiracDistribution(initialize_particles(q_initial))
+        )
+        posterior[initial_frame, joint_idx] = normalize_quat(
+            particle_filter.filter_state.mean()
+        )
+
+    previous_posterior = None
+    last_posterior = posterior[initial_frame].copy()
+
+    for frame_idx in frame_order[1:]:
+        frame_idx = int(frame_idx)
+        current_posterior = np.zeros((num_joints, 4))
+
+        if previous_posterior is None:
+            increments = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (num_joints, 1))
+        else:
+            # Extrapolate the last filtered joint rotation.  This preserves
+            # smooth, fast motion better than a pure identity random walk.
+            increments = normalize_quat(
+                quat_multiply(last_posterior, quat_conjugate(previous_posterior))
+            )
+
+        for joint_idx, particle_filter in enumerate(particle_filters):
+            particles = quat_multiply(increments[joint_idx], particle_filter.filter_state.d)
+            particles += np.random.randn(len(particles), 4) * PROCESS_NOISE_STD
+            particle_filter.filter_state.d = normalize_quat(particles)
+
+            q_prediction = normalize_quat(particle_filter.filter_state.mean())
+            q_observed = observations[frame_idx, joint_idx]
+            predicted[frame_idx, joint_idx] = q_prediction
+            residuals[frame_idx, joint_idx] = quat_geodesic_distance(
+                q_prediction, q_observed
+            )
+
+            # The score above is computed before this update.  Keeping the
+            # measurement model fixed prevents the score from being altered
+            # because the current observation was already labelled unusual.
+            measurement = HyperhemisphericalWatsonDistribution(
+                q_observed, kappa=MEASUREMENT_KAPPA
+            )
+            particle_filter.update_nonlinear_using_likelihood(measurement.pdf)
+            current_posterior[joint_idx] = normalize_quat(
+                particle_filter.filter_state.mean()
+            )
+
+        posterior[frame_idx] = current_posterior
+        previous_posterior = last_posterior
+        last_posterior = current_posterior
+
+    return predicted, posterior, residuals
 
 
-
-# def adaptive_measurement_kappa(current_jump, mean_jump, threshold):
-#     if current_jump <= mean_jump:
-#         return high_measurement_kappa
-
-#     if current_jump >= threshold or np.isclose(threshold, mean_jump):
-#         return low_measurement_kappa
-
-#     jump_ratio = (current_jump - mean_jump) / (threshold - mean_jump)
-#     return high_measurement_kappa - jump_ratio * (high_measurement_kappa - low_measurement_kappa)
-
-
-observed_jump_magnitudes, mean_jump_per_joint, std_jump_per_joint, jump_thresholds = (
-    compute_observed_jump_statistics(poses)
-)
-
-high_kappa_per_joint, low_kappa_per_joint = compute_kappa_bounds(
-    mean_jump_per_joint, std_jump_per_joint, jump_thresholds
-)
-
-
-
-# EMA estimator — one object, tracks ALL joints simultaneously
-# warm-started so frame 1 already has sensible bounds
-kappa_estimator = OnlineKappaEstimator(
-    n_joints=num_joints,
-    alpha=0.02,
-    initial_mean=mean_jump_per_joint,
-    initial_std=std_jump_per_joint,
-)
-
-
-
-
-def adaptive_measurement_kappa(current_jump, mean_jump, threshold,
-                                   high_kappa, low_kappa, smoothness=3.0):
-    """
-    Smooth exponential blend between high_kappa and low_kappa.
-    All inputs are scalars (called per-joint inside the loop).
-    smoothness: controls how sharply kappa drops as jump approaches threshold.
-    """
-    jump_ratio = np.clip(
-        (current_jump - mean_jump) / (threshold - mean_jump + 1e-9),
-        0.0, 1.0
-    )
-    # Exponential decay: stays near high_kappa until ratio rises, then drops fast
-    blend = 1.0 - np.exp(-smoothness * (1.0 - jump_ratio))
-    # Remap so blend=0 → high_kappa, blend=1 → low_kappa
-    weight = np.exp(-smoothness * jump_ratio)
-    return high_kappa * weight + low_kappa * (1.0 - weight)
-
-
-
-
-
-def precompute_kappa_table(poses, num_frames, num_joints,
-                            std_multiplier=3.0, smoothness=3.0):
-    """
-    PASS 1: Single loop over all frames and joints.
-    Returns kappa_table shape (num_frames, num_joints) —
-    exact per-joint per-frame kappa, no EMA approximation.
-    """
-
-    # ── Step 1: compute all geodesic jumps ──────────────────────────────────
-    jump_magnitudes = np.zeros((num_frames - 1, num_joints))
-
-    for frame_idx in range(1, num_frames):
-        for joint_idx in range(num_joints):
-            q_prev = amass_to_filter_quat(poses[frame_idx - 1, joint_idx, :])
-            q_curr = amass_to_filter_quat(poses[frame_idx,     joint_idx, :])
-            jump_magnitudes[frame_idx - 1, joint_idx] = quat_geodesic_distance(q_prev, q_curr)
-
-    # ── Step 2: per-joint statistics (axis=0 → over frames) ─────────────────
-    mean_jump = np.mean(jump_magnitudes, axis=0)   # shape (n_joints,)
-    std_jump  = np.std(jump_magnitudes,  axis=0)   # shape (n_joints,)
-    threshold = mean_jump + std_multiplier * std_jump  # shape (n_joints,)
-
-    # ── Step 3: per-joint kappa bounds from statistics ───────────────────────
-    high_kappa = np.clip(1.0 / (2.0 * mean_jump ** 2 + 1e-8), 10.0, 500.0)
-    low_kappa  = np.clip(1.0 / (2.0 * threshold ** 2  + 1e-8),  1.0, 100.0)
-
-    # ── Step 4: per-frame per-joint kappa via smooth blend ───────────────────
-    # jump_magnitudes shape: (num_frames-1, num_joints)
-    # mean_jump, threshold shape: (num_joints,) → broadcast over frames
-
-    jump_ratio = np.clip(
-        (jump_magnitudes - mean_jump) / (threshold - mean_jump + 1e-9),
-        0.0, 1.0
-    )                                               # shape (num_frames-1, num_joints)
-
-    weight = np.exp(-smoothness * jump_ratio)       # shape (num_frames-1, num_joints)
-
-    kappa_table = np.clip(
-        high_kappa * weight + low_kappa * (1.0 - weight),
-        1.0, 500.0
-    )                                               # shape (num_frames-1, num_joints)
-
-    return kappa_table, jump_magnitudes, mean_jump, std_jump, threshold
-
-
-kappa_table, observed_jump_magnitudes, mean_jump_per_joint, \
-    std_jump_per_joint, jump_thresholds = precompute_kappa_table(
-        poses, num_frames, num_joints
+def robust_thresholds(scores: np.ndarray) -> np.ndarray:
+    """Return one robust two-sided residual threshold per joint."""
+    median = np.nanmedian(scores, axis=0)
+    mad = np.nanmedian(np.abs(scores - median), axis=0)
+    robust_sigma = 1.4826 * mad
+    return np.maximum(
+        median + MAD_MULTIPLIER * robust_sigma,
+        np.deg2rad(MIN_SCORE_DEG),
     )
 
-# One independent particle filter is maintained for each joint orientation.
-particle_filters = [
-    HyperhemisphericalParticleFilter(n_particles=n_particles, dim=3)
-    for _ in range(num_joints)
-]
 
-# Store estimated orientations for every frame and every joint in (x, y, z, w) format.
-estimates = np.zeros((num_frames, num_joints, 4))
-measurement_kappas = np.full((num_frames, num_joints), high_measurement_kappa)
+def run_bidirectional_hhpf(poses_amass: np.ndarray) -> dict[str, np.ndarray]:
+    """Score each joint-frame from predictions made in both time directions."""
+    observations = amass_to_filter_quat(poses_amass)
+    num_frames = observations.shape[0]
+    if num_frames < 3:
+        raise ValueError("At least three frames are needed for bidirectional scoring.")
 
-for current_joint_idx, pf in enumerate(particle_filters):
-    q0 = amass_to_filter_quat(poses[0, current_joint_idx, :])
-    particles = initialize_particles(q0, n_particles, process_noise_std)
-    pf.set_state(HyperhemisphericalDiracDistribution(particles))
-    estimates[0, current_joint_idx, :] = normalize_quat(pf.filter_state.mean())
+    forward_predicted, forward_posterior, forward_scores = run_directional_hhpf(
+        observations, np.arange(num_frames), RANDOM_SEED
+    )
+    backward_predicted, backward_posterior, backward_scores = run_directional_hhpf(
+        observations, np.arange(num_frames - 1, -1, -1), RANDOM_SEED + 1
+    )
 
-for frame_idx in range(1, num_frames):
-    # Called ONCE per frame — returns shape (n_joints,) arrays
-    # EMA state at this point reflects all frames seen so far
-    # hk, lk, thresh_online = kappa_estimator.kappa_bounds()
+    # An isolated bad frame must be unlikely from both of its temporal sides.
+    two_sided_scores = np.minimum(forward_scores, backward_scores)
+    thresholds = robust_thresholds(two_sided_scores)
+    anomaly_mask = two_sided_scores > thresholds[None, :]
 
-    current_frame_jumps = observed_jump_magnitudes[frame_idx - 1]  
-
-
-    for current_joint_idx, pf in enumerate(particle_filters):
-        # STEP 1 - PREDICT (random walk with noise)
-        particles = pf.filter_state.d
-        particles = particles + np.random.randn(len(particles), 4) * process_noise_std
-        particles = normalize_quat(particles)
-        pf.filter_state.d = particles
-
-        # STEP 2 - OBSERVE current joint quaternion
-        q_obs = amass_to_filter_quat(poses[frame_idx, current_joint_idx, :])
-
-        # STEP 3 - UPDATE (reweight particles against observation)
-        current_jump = observed_jump_magnitudes[frame_idx - 1, current_joint_idx]
-        # measurement_kappa = adaptive_measurement_kappa(
-        #     current_jump,
-        #     mean_jump_per_joint[current_joint_idx],
-        #     jump_thresholds[current_joint_idx],
-        # )
-        # measurement_kappa = adaptive_measurement_kappa(
-        #     current_jump = current_frame_jumps[current_joint_idx],
-        #     mean_jump    = kappa_estimator.ema_mean[current_joint_idx],
-        #     threshold    = thresh_online[current_joint_idx],
-        #     high_kappa   = hk[current_joint_idx],
-        #     low_kappa    = lk[current_joint_idx],
-        # )
-        measurement_kappa = float(kappa_table[frame_idx - 1, current_joint_idx])
-        measurement_kappas[frame_idx, current_joint_idx] = measurement_kappa
-        # measurement_kappa = float(np.clip(measurement_kappa, 1.0, MAX_SAFE_KAPPA))
-        # measurement_kappas[frame_idx, current_joint_idx] = measurement_kappa
-        meas_noise = HyperhemisphericalWatsonDistribution(q_obs, kappa=measurement_kappa)
-        pf.update_nonlinear_using_likelihood(meas_noise.pdf)
-
-        # STEP 4 - GET ESTIMATE
-        estimates[frame_idx, current_joint_idx, :] = normalize_quat(pf.filter_state.mean())
-    # EMA update — AFTER all joints processed for this frame
-    # uses current_frame_jumps shape (n_joints,) — updates all joints at once
-    # kappa_estimator.update(current_frame_jumps)
-
-# Optional copy in AMASS/numpy-quaternion order (w, x, y, z), useful when saving
-# estimates alongside the original AMASS pose data.
-estimates_amass_order = estimates[:, :, [3, 0, 1, 2]]
-
-#Calculate differnce in observed ad estimated orientations for every frame
-
-# Calculate jump magnitude between consecutive observed frames
-jump_magnitudes = []
-# for frame_idx in range(1, num_frames):
-#     q1 = observed_jump_magnitudes [frame_idx - 1, joint_idx, :]  # previous frame
-#     q2 = observed_jump_magnitudes [frame_idx, joint_idx, :]      # current frame
-#     q1 = normalize_quat(q1)
-#     q2 = normalize_quat(q2)
-    
-#     dist = quat_geodesic_distance(q1, q2)
-#     jump_magnitudes.append(dist)
-
-# jump_magnitudes = np.array(jump_magnitudes)
-
-jump_magnitudes = observed_jump_magnitudes[:, joint_idx]
-
-# # Adaptive threshold: mean + 3*std
-mean_jump = np.mean(jump_magnitudes)
-std_jump  = np.std(jump_magnitudes)
-threshold = mean_jump + 3 * std_jump
-
-# fig, ax = plt.subplots(figsize=(14, 5))
-# frames = np.arange(1, num_frames)
-
-# # --- split into normal / anomaly series for cleaner legend ---
-# anomaly_mask = jump_magnitudes > threshold
-# normal_mask  = ~anomaly_mask
-
-# # main jump line
-# ax.plot(frames, jump_magnitudes, color='#378ADD', linewidth=1.2,
-#         alpha=0.85, zorder=2, label='jump magnitude')
-
-# # shade under the line
-# ax.fill_between(frames, jump_magnitudes, alpha=0.08, color='#378ADD', zorder=1)
-
-# # threshold + mean lines
-# ax.axhline(threshold, color='#E24B4A', linewidth=1.4, linestyle='--',
-#            zorder=3, label=f'threshold  μ+3σ  ({threshold:.3f} rad)')
-# ax.axhline(mean_jump,  color='#888780', linewidth=1.0, linestyle=':',
-#            zorder=3, label=f'mean  ({mean_jump:.3f} rad)')
-
-# # anomaly scatter
-# ax.scatter(frames[anomaly_mask], jump_magnitudes[anomaly_mask],
-#            color='#E24B4A', s=55, zorder=5, label=f'anomaly  (n={anomaly_mask.sum()})')
-
-# # vertical drop-lines from anomaly dots to x-axis (optional, aids reading)
-# for f, v in zip(frames[anomaly_mask], jump_magnitudes[anomaly_mask]):
-#     ax.vlines(f, 0, v, color='#E24B4A', linewidth=0.6, alpha=0.35, zorder=4)
-
-# # --- shaded band: mean ± 1σ ---
-# ax.axhspan(mean_jump - std_jump, mean_jump + std_jump,
-#            color='#888780', alpha=0.07, zorder=0, label='±1σ band')
-
-# # labels & formatting
-# ax.set_xlabel('Frame index', fontsize=11)
-# ax.set_ylabel('Geodesic distance (rad)', fontsize=11)
-# ax.set_title(f'Orientation jump magnitudes — joint {joint_idx}', fontsize=13, fontweight='normal')
-# ax.set_xlim(frames[0], frames[-1])
-# ax.set_ylim(bottom=0)
-# ax.grid(True, linewidth=0.4, alpha=0.5, linestyle='--')
-# ax.spines[['top', 'right']].set_visible(False)
-# ax.legend(fontsize=9, framealpha=0.85, loc='upper right')
-
-# # annotate anomaly frame indices
-# for f, v in zip(frames[anomaly_mask], jump_magnitudes[anomaly_mask]):
-#     ax.annotate(f'f{f}', xy=(f, v), xytext=(4, 6),
-#                 textcoords='offset points', fontsize=8,
-#                 color='#E24B4A', fontweight='bold')
-
-# plt.tight_layout()
-# plt.savefig(f'jump_magnitudes_joint{joint_idx}.png', dpi=150, bbox_inches='tight')
-# plt.show()
-
-#2. Sudden jumps compared to estimated orientations
-# Distance between filter estimate and observation each frame
-filter_residuals = []
-for frame_idx in range(1, num_frames):
-    q_est = estimates[frame_idx, joint_idx, :]
-    
-    q_obs_raw = poses[frame_idx, joint_idx, :]
-    q_obs = np.array([q_obs_raw[1], q_obs_raw[2], q_obs_raw[3], q_obs_raw[0]])
-    if q_obs[-1] < 0: q_obs = -q_obs
-    
-    dist = quat_geodesic_distance(q_est, q_obs)
-    filter_residuals.append(dist)
-
-filter_residuals = np.array(filter_residuals)
-
-# Calculate residuals: estimate vs observation for every frame
-residuals = np.zeros(num_frames)
-
-for frame_idx in range(1, num_frames):
-    # filter estimate
-    q_est = estimates[frame_idx, joint_idx, :]
-    
-    # observed quaternion
-    q_obs_raw = poses[frame_idx, joint_idx, :]
-    q_obs = np.array([q_obs_raw[1], q_obs_raw[2], q_obs_raw[3], q_obs_raw[0]])
-    if q_obs[-1] < 0:
-        q_obs = -q_obs
-    
-    residuals[frame_idx] = quat_geodesic_distance(q_est, q_obs)
-
-# Threshold
-# mean_res = np.mean(residuals[1:])
-# std_res  = np.std(residuals[1:])
-# threshold = mean_res + 3 * std_res
-
-# # Incorrect frames
-# incorrect_frames = np.where(residuals > threshold)[0]
-
-# print(f"Mean residual : {np.degrees(mean_res):.2f} degrees")
-# print(f"Std residual  : {np.degrees(std_res):.2f} degrees")  
-# print(f"Threshold     : {np.degrees(threshold):.2f} degrees")
-# print(f"Incorrect frames: {incorrect_frames}")
-# print(f"Residuals at incorrect frames (degrees):")
-# for f in incorrect_frames:
-#     print(f"  frame {f:4d}: {np.degrees(residuals[f]):.2f}°")
+    return {
+        "observations": observations,
+        "forward_predicted": forward_predicted,
+        "backward_predicted": backward_predicted,
+        "forward_posterior": forward_posterior,
+        "backward_posterior": backward_posterior,
+        "forward_scores": forward_scores,
+        "backward_scores": backward_scores,
+        "two_sided_scores": two_sided_scores,
+        "thresholds": thresholds,
+        "anomaly_mask": anomaly_mask,
+    }
 
 
-# plt.figure(figsize=(12, 4))
-# plt.plot(np.degrees(residuals), label='filter residual', color='steelblue')
-# plt.axhline(np.degrees(threshold), color='red', linestyle='--', label=f'threshold ({np.degrees(threshold):.1f}°)')
-# plt.scatter(incorrect_frames, np.degrees(residuals[incorrect_frames]), 
-#             color='red', zorder=5, s=50, label=f'incorrect ({len(incorrect_frames)} frames)')
-# plt.xlabel('Frame')
-# plt.ylabel('Angular error (degrees)')
-# plt.title('Incorrect observed orientations — Joint 0')
-# plt.legend()
-# plt.tight_layout()
-# plt.show()
+def print_flagged_frames(result: dict[str, np.ndarray]) -> None:
+    mask = result["anomaly_mask"]
+    thresholds = result["thresholds"]
+    scores = result["two_sided_scores"]
+    print("\nBidirectional HHPF candidates (observed vs predicted orientation):")
+    print(f"Total candidate frames: {np.count_nonzero(mask.any(axis=1))}")
+    for joint_idx in range(mask.shape[1]):
+        frames = np.flatnonzero(mask[:, joint_idx])
+        if len(frames) == 0:
+            continue
+        frame_scores_deg = np.degrees(scores[frames, joint_idx])
+        print(
+            f"  joint {joint_idx:2d}: {len(frames)} frames {frames.tolist()} "
+            f"| threshold={np.degrees(thresholds[joint_idx]):.2f} deg "
+            f"| scores={np.round(frame_scores_deg, 2).tolist()}"
+        )
 
 
-fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=True)
-fig.subplots_adjust(hspace=0.08)  # tight gap since x-axis is shared
+def style_header(worksheet, header_row: int, last_column: int) -> None:
+    """Apply a compact, readable header style to a report sheet."""
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(bold=True, color="FFFFFF")
+    for column_idx in range(1, last_column + 1):
+        cell = worksheet.cell(header_row, column_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
 
-frames = np.arange(1, num_frames)
 
-# ── shared helpers ────────────────────────────────────────────────────────────
-def plot_jump_panel(ax, data, label_y, title, color='#378ADD'):
-    mean_v = np.mean(data)
-    std_v  = np.std(data)
-    thresh = mean_v + 3 * std_v
-    mask   = data > thresh
+def export_incorrect_frames_excel(
+    result: dict[str, np.ndarray],
+    output_path: Path = EXCEL_REPORT_PATH,
+) -> Path:
+    """Write all joint-frame HHPF candidates to an auditable Excel workbook."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ax.plot(frames, data, color=color, linewidth=1.2, alpha=0.85, zorder=2,
-            label=label_y)
-    ax.fill_between(frames, data, alpha=0.08, color=color, zorder=1)
+    mask = result["anomaly_mask"]
+    num_frames, num_joints = mask.shape
+    thresholds_deg = np.degrees(result["thresholds"])
+    two_sided_scores_deg = np.degrees(result["two_sided_scores"])
 
-    ax.axhline(thresh,       color='#E24B4A', linewidth=1.4, linestyle='--', zorder=3,
-               label=f'threshold  μ+3σ  ({thresh:.3f} rad)')
-    ax.axhline(mean_v,       color='#888780', linewidth=1.0, linestyle=':',  zorder=3,
-               label=f'mean  ({mean_v:.3f} rad)')
-    ax.axhspan(mean_v - std_v, mean_v + std_v,
-               color='#888780', alpha=0.07, zorder=0, label='±1σ band')
+    workbook = Workbook()
+    summary_sheet = workbook.active
+    summary_sheet.title = "Summary"
+    summary_sheet.sheet_view.showGridLines = False
+    summary_sheet.append(["Metric", "Value"])
+    summary_sheet.append(["Random seed", RANDOM_SEED])
+    summary_sheet.append(["Frames processed", num_frames])
+    summary_sheet.append(["Joints processed", num_joints])
+    summary_sheet.append(["Candidate frames", int(np.count_nonzero(mask.any(axis=1)))])
+    summary_sheet.append(["Candidate joint-frames", int(np.count_nonzero(mask))])
+    summary_sheet.append(["Particles per joint", N_PARTICLES])
+    summary_sheet.append(["Process noise standard deviation", PROCESS_NOISE_STD])
+    summary_sheet.append(["Watson measurement kappa", MEASUREMENT_KAPPA])
+    summary_sheet.append(["MAD multiplier", MAD_MULTIPLIER])
+    summary_sheet.append(["Minimum score threshold (degrees)", MIN_SCORE_DEG])
+    style_header(summary_sheet, header_row=1, last_column=2)
+    summary_sheet.column_dimensions["A"].width = 36
+    summary_sheet.column_dimensions["B"].width = 18
+    summary_sheet.freeze_panes = "A2"
 
-    ax.scatter(frames[mask], data[mask],
-               color='#E24B4A', s=55, zorder=5,
-               label=f'anomaly  (n={mask.sum()})')
-    for f, v in zip(frames[mask], data[mask]):
-        ax.vlines(f, 0, v, color='#E24B4A', linewidth=0.6, alpha=0.35, zorder=4)
-        ax.annotate(f'f{f}', xy=(f, v), xytext=(4, 6),
-                    textcoords='offset points', fontsize=8,
-                    color='#E24B4A', fontweight='bold')
+    joint_sheet = workbook.create_sheet("Joint Summary")
+    joint_sheet.sheet_view.showGridLines = False
+    joint_sheet.append(
+        [
+            "Joint index",
+            "Candidate joint-frames",
+            "Two-sided threshold (degrees)",
+            "Maximum two-sided score (degrees)",
+        ]
+    )
+    for joint_idx in range(num_joints):
+        joint_scores = two_sided_scores_deg[:, joint_idx]
+        finite_scores = joint_scores[np.isfinite(joint_scores)]
+        max_score = float(np.max(finite_scores)) if len(finite_scores) else None
+        joint_sheet.append(
+            [
+                joint_idx,
+                int(np.count_nonzero(mask[:, joint_idx])),
+                float(thresholds_deg[joint_idx]),
+                max_score,
+            ]
+        )
+    style_header(joint_sheet, header_row=1, last_column=4)
+    joint_sheet.freeze_panes = "A2"
+    joint_sheet.auto_filter.ref = f"A1:D{joint_sheet.max_row}"
+    for column in ("C", "D"):
+        joint_sheet.column_dimensions[column].width = 31
+        for cell in joint_sheet[column][1:]:
+            cell.number_format = "0.000"
+    joint_sheet.column_dimensions["A"].width = 16
+    joint_sheet.column_dimensions["B"].width = 25
 
-    ax.set_ylabel('Geodesic distance (rad)', fontsize=10)
-    ax.set_title(title, fontsize=12, fontweight='normal', pad=6)
-    ax.set_ylim(bottom=0)
-    ax.grid(True, linewidth=0.4, alpha=0.5, linestyle='--')
-    ax.spines[['top', 'right']].set_visible(False)
-    ax.legend(fontsize=8.5, framealpha=0.85, loc='upper right')
+    incorrect_sheet = workbook.create_sheet("Incorrect Frames")
+    incorrect_sheet.sheet_view.showGridLines = False
+    headers = [
+        "Frame index",
+        "Joint index",
+        "Forward residual (degrees)",
+        "Backward residual (degrees)",
+        "Two-sided score (degrees)",
+        "Joint threshold (degrees)",
+        "Observed qx",
+        "Observed qy",
+        "Observed qz",
+        "Observed qw",
+        "Forward predicted qx",
+        "Forward predicted qy",
+        "Forward predicted qz",
+        "Forward predicted qw",
+        "Backward predicted qx",
+        "Backward predicted qy",
+        "Backward predicted qz",
+        "Backward predicted qw",
+    ]
+    incorrect_sheet.append(headers)
+    forward_scores_deg = np.degrees(result["forward_scores"])
+    backward_scores_deg = np.degrees(result["backward_scores"])
+    observations = result["observations"]
+    forward_predicted = result["forward_predicted"]
+    backward_predicted = result["backward_predicted"]
 
-    return thresh, mask          # caller can use if needed
+    for frame_idx, joint_idx in np.argwhere(mask):
+        incorrect_sheet.append(
+            [
+                int(frame_idx),
+                int(joint_idx),
+                float(forward_scores_deg[frame_idx, joint_idx]),
+                float(backward_scores_deg[frame_idx, joint_idx]),
+                float(two_sided_scores_deg[frame_idx, joint_idx]),
+                float(thresholds_deg[joint_idx]),
+                *[float(value) for value in observations[frame_idx, joint_idx]],
+                *[float(value) for value in forward_predicted[frame_idx, joint_idx]],
+                *[float(value) for value in backward_predicted[frame_idx, joint_idx]],
+            ]
+        )
 
-# ── panel 1 : consecutive-frame jumps ────────────────────────────────────────
-plot_jump_panel(
-    axes[0], jump_magnitudes,
-    label_y='jump magnitude',
-    title=f'Consecutive-frame orientation jumps — joint {joint_idx}',
-)
+    style_header(incorrect_sheet, header_row=1, last_column=len(headers))
+    incorrect_sheet.freeze_panes = "A2"
+    incorrect_sheet.auto_filter.ref = f"A1:R{incorrect_sheet.max_row}"
+    for column_idx in range(3, len(headers) + 1):
+        for row_idx in range(2, incorrect_sheet.max_row + 1):
+            incorrect_sheet.cell(row_idx, column_idx).number_format = "0.000000"
+    for column_idx in range(1, len(headers) + 1):
+        incorrect_sheet.column_dimensions[chr(64 + column_idx)].width = 23
+    incorrect_sheet.column_dimensions["A"].width = 14
+    incorrect_sheet.column_dimensions["B"].width = 14
 
-# ── panel 2 : filter residuals (estimate vs observation) ─────────────────────
-plot_jump_panel(
-    axes[1], filter_residuals,
-    label_y='filter residual',
-    title=f'Filter residual (estimate vs observation) — joint {joint_idx}',
-    color='#1D9E75',             # teal to distinguish from panel 1
-)
+    if incorrect_sheet.max_row > 1:
+        table = Table(displayName="IncorrectFrames", ref=f"A1:R{incorrect_sheet.max_row}")
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2", showRowStripes=True, showColumnStripes=False
+        )
+        incorrect_sheet.add_table(table)
 
-axes[1].set_xlabel('Frame index', fontsize=10)
-axes[0].set_xlim(frames[0], frames[-1])   # shared x propagates automatically
+    workbook.save(output_path)
+    return output_path
 
-plt.suptitle(f'Joint {joint_idx} — orientation diagnostics', fontsize=13,
-             y=1.01, fontweight='normal')
 
-plt.tight_layout()
-output_dir = Path("outputs")
-output_dir.mkdir(exist_ok=True)
-plt.savefig(output_dir / f'orientation_diagnostics_joint{joint_idx}.png', dpi=150,
-            bbox_inches='tight')
-plt.show()
+def plot_joint_scores(result: dict[str, np.ndarray], joint_idx: int) -> None:
+    """Save forward, backward, and two-sided prediction diagnostics."""
+    num_frames = result["observations"].shape[0]
+    frames = np.arange(num_frames)
+    forward_deg = np.degrees(result["forward_scores"][:, joint_idx])
+    backward_deg = np.degrees(result["backward_scores"][:, joint_idx])
+    two_sided_deg = np.degrees(result["two_sided_scores"][:, joint_idx])
+    threshold_deg = np.degrees(result["thresholds"][joint_idx])
+    anomaly_mask = result["anomaly_mask"][:, joint_idx]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    panels = (
+        (axes[0], forward_deg, "Forward pre-update prediction residual"),
+        (axes[1], backward_deg, "Backward pre-update prediction residual"),
+        (axes[2], two_sided_deg, "Two-sided score: min(forward, backward)"),
+    )
+    for axis, scores_deg, title in panels:
+        axis.plot(frames, scores_deg, color="#378ADD", linewidth=1.2)
+        axis.set_ylabel("Degrees")
+        axis.set_title(title, fontsize=11)
+        axis.set_ylim(bottom=0)
+        axis.grid(True, linewidth=0.4, alpha=0.5, linestyle="--")
+        axis.spines[["top", "right"]].set_visible(False)
+
+    axes[2].axhline(
+        threshold_deg,
+        color="#E24B4A",
+        linewidth=1.4,
+        linestyle="--",
+        label=f"robust threshold ({threshold_deg:.2f} deg)",
+    )
+    axes[2].scatter(
+        frames[anomaly_mask],
+        two_sided_deg[anomaly_mask],
+        color="#E24B4A",
+        s=45,
+        zorder=3,
+        label=f"candidate frames ({anomaly_mask.sum()})",
+    )
+    axes[2].legend(loc="upper right")
+    axes[2].set_xlabel("Frame index")
+    fig.suptitle(f"Bidirectional HHPF orientation diagnostics - joint {joint_idx}")
+    fig.tight_layout()
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    output_path = OUTPUT_DIR / f"bidirectional_hhpf_joint{joint_idx}.png"
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    print(f"Saved diagnostic plot: {output_path}")
+    plt.show()
+
+
+def main() -> None:
+    poses_amass = process_sequence(FILE_ID)
+    result = run_bidirectional_hhpf(poses_amass)
+    report_path = export_incorrect_frames_excel(result)
+    print(f"Saved Excel report: {report_path}")
+    print_flagged_frames(result)
+    plot_joint_scores(result, JOINT_IDX_FOR_PLOT)
+
+
+if __name__ == "__main__":
+    main()

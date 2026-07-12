@@ -18,6 +18,7 @@ htmlcov/
 # Virtual environments and local configuration
 .env
 .venv/
+skel_venv/
 venv/
 env/
 ENV/
