@@ -4,8 +4,8 @@ from pathlib import Path
 import quaternion
 import os
 
-input_path= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\PoseDataParticleFilter\Subject_1_F_1_poses.npz"
-output_path= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\PoseDataParticleFilter\Subject_1_F_1_poses_quaternion.npz"
+input_path= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\PoseDataParticleFilter\Subject_1_F_1_poses_corrupted.npz"
+output_path= r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\PoseDataParticleFilter\Subject_1_F_1_poses_corrupted_quaternions.npz"
 
 # Create output folder if it doesn't exist
 # os.makedirs(OUTPUT_FOLDER, exist_ok=True)
