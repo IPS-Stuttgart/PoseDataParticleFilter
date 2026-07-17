@@ -23,7 +23,7 @@ from pyrecest.distributions import (
 from pyrecest.filters import HyperhemisphericalParticleFilter
 
 
-FILE_ID = "1772qebtt6dd3H4o0hyHROEnjBEB7BYH9"
+FILE_ID = "1F-XL8Tf59lbakNkMhEPjvkr3wT4O0MEW"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
 RANDOM_SEED = 20260712
@@ -202,7 +202,7 @@ def run_bidirectional_hhpf(poses_amass: np.ndarray) -> dict[str, np.ndarray]:
     )
 
     # An isolated bad frame must be unlikely from both of its temporal sides.
-    two_sided_scores = np.minimum(forward_scores, backward_scores)
+    two_sided_scores = np.maximum(forward_scores, backward_scores)
     thresholds = robust_thresholds(two_sided_scores)
     anomaly_mask = two_sided_scores > thresholds[None, :]
 

@@ -1,8 +1,8 @@
 import cv2
 import os
 
-video_path = r"C:\Users\ragha\Desktop\important ids and documents\ml research prof.florian\BMLmovi\actual_human_videos\F_CP1_Subject_1.mp4"
-output_folder = "frames_BML_movi"
+video_path = r"frames_video\Subject_1_F_1.mp4"
+output_folder = r"frames\bml_movi_renders"
 
 os.makedirs(output_folder, exist_ok=True)
 
