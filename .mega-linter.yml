@@ -1,6 +1,6 @@
 ---
-# Keep MegaLinter focused on checks that are useful across these Python repos
-# before strict typing, spelling, and security-scan baselines are established.
+# Keep MegaLinter focused on project-owned code. SKEL is vendored upstream
+# material and is therefore excluded from repository-wide lint enforcement.
 ENABLE_LINTERS:
   - ACTION_ACTIONLINT
   - MARKDOWN_MARKDOWNLINT
@@ -13,3 +13,4 @@ VALIDATE_ALL_CODEBASE: true
 PRINT_ALPACA: false
 SHOW_ELAPSED_TIME: true
 FLAVOR_SUGGESTIONS: false
+FILTER_REGEX_EXCLUDE: '(^SKEL/)'

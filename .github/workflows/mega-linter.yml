@@ -29,7 +29,7 @@ jobs:
           fetch-depth: 0
 
       - name: Run MegaLinter
-        uses: oxsecurity/megalinter/flavors/python@v9.4.0
+        uses: oxsecurity/megalinter/flavors/python@v10.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

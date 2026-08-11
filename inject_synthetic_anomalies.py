@@ -290,11 +290,11 @@ np.savez(
 print(f"\nInjected {len(events)} events covering "
       f"{int(bool_mask.any(axis=1).sum())} / {n_frames} frames "
       f"({100 * bool_mask.any(axis=1).sum() / n_frames:.1f}%) as positives.")
-print(f"\nBy type:")
+print("\nBy type:")
 for t in TYPES:
     n = sum(1 for e in events if e["type"] == t)
     print(f"  {t:10s}: {n} events")
-print(f"\nBy severity:")
+print("\nBy severity:")
 for tier in SEVERITY_DEG:
     n = sum(1 for e in events if e["severity_tier"] == tier)
     print(f"  {tier:10s}: {n} events")
