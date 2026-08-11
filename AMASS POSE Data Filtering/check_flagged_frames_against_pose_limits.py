@@ -134,7 +134,7 @@ for f in frames_flagged_by_both:
     joint_names = [SMPL_JOINT_NAMES.get(j, f'joint_{j}') for j in joints_here]
     print(f"\nFrame {f}:")
     print(f"  Raw-jump flagged SMPL joints: {joint_names}")
-    print(f"  SKEL limit violations:")
+    print("  SKEL limit violations:")
     for name, val, limits in skel_violations[f]:
         print(f"    {name}: {val:.3f} rad, limit {limits}")
 
