@@ -1,0 +1,5 @@
+[lint.per-file-ignores]
+# These two exploratory scripts intentionally use f-strings for uniform output
+# formatting even where a particular message currently has no interpolation.
+"AMASS POSE Data Filtering/check_flagged_frames_against_pose_limits.py" = ["F541"]
+"inject_synthetic_anomalies.py" = ["F541"]
